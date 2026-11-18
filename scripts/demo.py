@@ -96,6 +96,20 @@ def main() -> int:
         package2.raise_for_status()
         assert hashlib.sha256(package2.content).hexdigest() == done2["verified_sha256"]
         print("revision switch verified:", done2["source_revision"], done2["verified_sha256"][:12])
+
+        # The revision-impact manifest says which moments must be recomputed.
+        revisions = client.get(f"{api}/tasks/{task_id}/revisions").json()["revisions"]
+        assert len(revisions) == 1, revisions
+        manifest = revisions[0]
+        assert manifest["previous_sha256"] == done["verified_sha256"]
+        assert manifest["current_sha256"] == done2["verified_sha256"]
+        print(
+            "revision manifest: "
+            f"added={manifest['added']} withdrawn={manifest['withdrawn']} "
+            f"changed={manifest['changed']}"
+        )
+        for change in manifest["changes"][:5]:
+            print("  ", change["time"], change["kind"], change.get("fields") or "")
         print("events:", [e["event"] for e in client.get(f"{api}/tasks/{task_id}/events").json()])
     return 0
 

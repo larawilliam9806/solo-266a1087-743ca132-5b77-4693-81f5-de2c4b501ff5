@@ -31,6 +31,7 @@ STREAM_CHUNK = 32 * 1024
 @dataclass
 class SourceState:
     revisions: dict[tuple[str, str], str] = field(default_factory=dict)
+    overrides: dict[tuple[str, str], tuple[str, bytes]] = field(default_factory=dict)
     delay_seconds: float = 0.0
     chunk_delay_seconds: float = 0.0
     failing: set[tuple[str, str]] = field(default_factory=set)
@@ -52,6 +53,14 @@ class SourceState:
 
     def revision(self, station: str, date: str) -> str:
         return self.revisions.get((station, date), "v1")
+
+    def package(self, station: str, date: str) -> tuple[str, bytes]:
+        """The current (revision, body) for a station/date."""
+        override = self.overrides.get((station, date))
+        if override is not None:
+            return override
+        revision = self.revision(station, date)
+        return revision, build_package(station, date, revision)
 
 
 state = SourceState()
@@ -90,6 +99,36 @@ class DelayRequest(BaseModel):
     chunk_seconds: float = Field(0, ge=0, le=5, description="Delay between body chunks")
 
 
+class PackageOverrideRequest(BaseModel):
+    """Serve an explicit observations.csv as the current package revision."""
+
+    station: str
+    date: str
+    revision: str = Field(..., min_length=1, max_length=64)
+    csv_text: str = Field(..., min_length=1, max_length=5_000_000)
+
+    @field_validator("station")
+    @classmethod
+    def valid_station(cls, value: str) -> str:
+        if not STATION_RE.fullmatch(value):
+            raise ValueError("station must match [A-Za-z0-9_-]{1,32}")
+        return value
+
+    @field_validator("date")
+    @classmethod
+    def valid_date(cls, value: str) -> str:
+        if not DATE_RE.fullmatch(value):
+            raise ValueError("date must be YYYY-MM-DD")
+        return value
+
+    @field_validator("revision")
+    @classmethod
+    def safe_revision(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+            raise ValueError("revision must match [A-Za-z0-9_.-]+")
+        return value
+
+
 class FaultRequest(BaseModel):
     station: str
     date: str
@@ -116,26 +155,7 @@ def _validate(station: str, date: str) -> None:
         raise HTTPException(400, "invalid date")
 
 
-@lru_cache(maxsize=64)
-def build_package(station: str, date: str, revision: str) -> bytes:
-    """Build a deterministic tar.gz for (station, date, revision).
-
-    The payload is mostly incompressible so progress and Range behaviour are
-    observable, and switching revisions changes both bytes and digest.
-    """
-    seed = hashlib.sha256(f"{station}|{date}|{revision}".encode()).digest()
-    rng = random.Random(seed)
-    blob = rng.randbytes(1024 * 1024)
-    rows = [
-        "station,date,time,temperature_c,pressure_hpa,wind_mps",
-        *[
-            f"{station},{date},{(i // 4) % 24:02d}:{(i * 15) % 60:02d},"
-            f"{rng.uniform(-35, 45):.2f},{rng.uniform(850, 1080):.2f},{rng.uniform(0, 30):.2f}"
-            for i in range(240)
-        ],
-    ]
-    csv_bytes = ("\n".join(rows) + "\n").encode()
-
+def _tar_gz(station: str, date: str, revision: str, csv_bytes: bytes, blob: bytes) -> bytes:
     tar_buffer = io.BytesIO()
     with tarfile.open(fileobj=tar_buffer, mode="w") as archive:
         def add(name: str, data: bytes) -> None:
@@ -154,9 +174,83 @@ def build_package(station: str, date: str, revision: str) -> bytes:
     return gzip.compress(tar_buffer.getvalue(), mtime=0)
 
 
+def _csv_text(rows: list[list[str]]) -> bytes:
+    lines = ["station,date,time,temperature_c,pressure_hpa,wind_mps"]
+    lines.extend(",".join(row) for row in rows)
+    return ("\n".join(lines) + "\n").encode()
+
+
+@lru_cache(maxsize=64)
+def build_package(station: str, date: str, revision: str) -> bytes:
+    """Build a deterministic tar.gz for (station, date, revision).
+
+    Base rows depend only on (station, date); a non-baseline revision applies
+    its own deterministic corrections — a few modified values, a few withdrawn
+    moments and a few added ones — so a revision switch changes the bytes, the
+    digest AND the observation content in a realistic way.  The payload is
+    mostly incompressible so progress and Range behaviour are observable.
+    """
+    seed = hashlib.sha256(f"{station}|{date}".encode()).digest()
+    rng = random.Random(seed)
+    rows = [
+        [
+            station,
+            date,
+            f"{(i // 4) % 24:02d}:{(i * 15) % 60:02d}",
+            f"{rng.uniform(-35, 45):.2f}",
+            f"{rng.uniform(850, 1080):.2f}",
+            f"{rng.uniform(0, 30):.2f}",
+        ]
+        for i in range(240)
+    ]
+    blob = rng.randbytes(1024 * 1024)
+
+    if revision != "v1":
+        edit = random.Random(
+            hashlib.sha256(f"{station}|{date}|{revision}".encode()).digest()
+        )
+        # Modify some values in place.
+        for row in rows:
+            if edit.random() < 0.08:
+                idx = edit.choice((3, 4, 5))
+                row[idx] = f"{float(row[idx]) + edit.uniform(-3, 3):.2f}"
+        # Withdraw a few moments entirely (all rows at those times).
+        moments = sorted({row[2] for row in rows})
+        withdrawn = set(edit.sample(moments, k=3))
+        rows = [row for row in rows if row[2] not in withdrawn]
+        # Add a few new moments.
+        existing = {row[2] for row in rows}
+        added = 0
+        while added < 3:
+            moment = f"{edit.randrange(24):02d}:{edit.randrange(60):02d}"
+            if moment in existing:
+                continue
+            existing.add(moment)
+            rows.append(
+                [
+                    station,
+                    date,
+                    moment,
+                    f"{edit.uniform(-35, 45):.2f}",
+                    f"{edit.uniform(850, 1080):.2f}",
+                    f"{edit.uniform(0, 30):.2f}",
+                ]
+            )
+            added += 1
+
+    return _tar_gz(station, date, revision, _csv_text(rows), blob)
+
+
+def build_custom_package(station: str, date: str, revision: str, csv_text: str) -> bytes:
+    """Build a package around an explicit observations.csv payload."""
+    blob_rng = random.Random(hashlib.sha256(csv_text.encode()).digest())
+    return _tar_gz(
+        station, date, revision, csv_text.encode(), blob_rng.randbytes(256 * 1024)
+    )
+
+
 def _meta(station: str, date: str) -> dict:
-    revision = state.revision(station, date)
-    body = build_package(station, date, revision)
+    revision, body = state.package(station, date)
     digest = hashlib.sha256(body).hexdigest()
     return {
         "name": f"{station}-{date}.tar.gz",
@@ -233,7 +327,7 @@ async def package(
     if (station, date) in state.failing:
         raise HTTPException(503, "simulated source outage")
     entry = _meta(station, date)
-    body = build_package(station, date, entry["revision"])
+    revision, body = state.package(station, date)
     etag = entry["etag"]
     if (station, date) in state.corrupting:
         # Advertise the honest digest but serve a body with a flipped byte.
@@ -302,6 +396,7 @@ async def admin_state() -> dict:
             {"station": station, "date": date, "revision": revision}
             for (station, date), revision in sorted(state.revisions.items())
         ],
+        "overrides": sorted(f"{s}/{d}" for (s, d) in state.overrides),
         "failing": sorted(f"{s}/{d}" for s, d in state.failing),
         "corrupting": sorted(f"{s}/{d}" for s, d in state.corrupting),
         "no_range": sorted(f"{s}/{d}" for s, d in state.no_range),
@@ -313,8 +408,24 @@ async def admin_state() -> dict:
 
 @app.post("/admin/revision")
 async def set_revision(body: RevisionRequest) -> dict:
-    state.revisions[(body.station, body.date)] = body.revision
+    key = (body.station, body.date)
+    state.overrides.pop(key, None)  # an explicit revision switch drops any override
+    state.revisions[key] = body.revision
     return {"station": body.station, "date": body.date, "revision": body.revision, "entry": _meta(body.station, body.date)}
+
+
+@app.post("/admin/package")
+async def set_package(body: PackageOverrideRequest) -> dict:
+    data = build_custom_package(body.station, body.date, body.revision, body.csv_text)
+    key = (body.station, body.date)
+    state.overrides[key] = (body.revision, data)
+    state.revisions[key] = body.revision
+    return {
+        "station": body.station,
+        "date": body.date,
+        "revision": body.revision,
+        "entry": _meta(body.station, body.date),
+    }
 
 
 @app.post("/admin/fault")
@@ -342,6 +453,7 @@ async def set_delay(body: DelayRequest) -> dict:
 @app.post("/admin/reset")
 async def reset() -> dict:
     state.revisions.clear()
+    state.overrides.clear()
     state.delay_seconds = 0.0
     state.chunk_delay_seconds = 0.0
     state.failing.clear()

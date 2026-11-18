@@ -1,19 +1,29 @@
-"""FastAPI application: task lifecycle, progress, package download."""
+"""FastAPI application: task lifecycle, progress, package download, revision impact."""
 
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 
 from . import __version__
 from .collector import Collector
 from .config import Settings
-from .models import ErrorResponse, StartTaskRequest, TaskState, TaskView
+from .models import (
+    ErrorResponse,
+    RevisionChange,
+    RevisionListView,
+    RevisionManifestView,
+    StartTaskRequest,
+    TaskState,
+    TaskView,
+)
 from .store import utcnow
 
 
@@ -23,9 +33,7 @@ def _view(row, base_url: str, package_ok: bool) -> TaskView:
         percent = round(min(100.0, row["downloaded_bytes"] * 100.0 / row["expected_size"]), 2)
     if row["state"] == "completed":
         percent = 100.0
-    download_url = None
-    if row["state"] == "completed" and package_ok:
-        download_url = f"{base_url}/tasks/{row['id']}/package"
+    download_url = f"{base_url}/tasks/{row['id']}/package" if package_ok else None
     return TaskView(
         id=row["id"],
         station=row["station"],
@@ -45,10 +53,30 @@ def _view(row, base_url: str, package_ok: bool) -> TaskView:
         attempts=row["attempts"],
         resyncs=row["resyncs"],
         generation=row["generation"],
+        latest_revision_seq=row["latest_revision_seq"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         completed_at=row["completed_at"],
         download_url=download_url,
+        revisions_url=f"{base_url}/tasks/{row['id']}/revisions",
+    )
+
+
+def _manifest_view(row) -> RevisionManifestView:
+    changes = [RevisionChange(**change) for change in json.loads(row["changes_json"])]
+    return RevisionManifestView(
+        seq=row["seq"],
+        station=row["station"],
+        date=row["date"],
+        previous_sha256=row["previous_sha256"],
+        current_sha256=row["current_sha256"],
+        previous_revision=row["previous_revision"],
+        current_revision=row["current_revision"],
+        created_at=row["created_at"],
+        added=row["added_count"],
+        withdrawn=row["withdrawn_count"],
+        changed=row["changed_count"],
+        changes=changes,
     )
 
 
@@ -82,14 +110,12 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
             raise HTTPException(404, detail="task not found")
 
     def package_ready(row) -> bool:
+        # The published package stays available across states: during a refresh
+        # (running), after a failed refresh (failed) or a pause, the previous
+        # validated package keeps being served.  Only tasks that never
+        # published anything have no package at all.
         path = row["package_path"]
-        return bool(
-            row["state"] == "completed"
-            and path
-            and Path(path).is_file()
-            and row["verified_size"] == row["expected_size"] is not None
-            and row["verified_sha256"] == row["expected_sha256"]
-        )
+        return bool(path and row["verified_sha256"] and Path(path).is_file())
 
     def view(row, request: Request) -> TaskView:
         base = str(request.base_url).rstrip("/")
@@ -175,28 +201,96 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
             for row in collector.store.events(task_id)
         ]
 
+    def _open_publication(row):
+        """Open the published package file for the row's current publication.
+
+        Opening pins the inode: once open, a concurrent refresh may commit and
+        unlink the path, but the reader still streams the exact bytes that were
+        published together with the row's ``verified_sha256``.
+        """
+        path = row["package_path"]
+        if not path or not row["verified_sha256"]:
+            return None
+        try:
+            return open(path, "rb")
+        except OSError:
+            return None
+
     @app.get(
         "/tasks/{task_id}/package",
         responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
     )
     async def download_package(task_id: str):
         row = row_or_404(task_id)
-        if row["state"] != "completed":
-            raise HTTPException(409, detail=f"task is {row['state']}; no package available")
-        if not package_ready(row):
-            raise HTTPException(409, detail="package missing or failed verification")
-        if not Path(row["package_path"]).is_file():
+        handle = _open_publication(row)
+        if handle is None:
+            # The publication may have been replaced between reading the row
+            # and opening the file; re-read once before giving up.
+            fresh = collector.store.get(task_id)
+            if fresh is not None and fresh["package_path"] != row["package_path"]:
+                row = fresh
+                handle = _open_publication(row)
+        if handle is None:
+            if not row["package_path"] or not row["verified_sha256"]:
+                raise HTTPException(
+                    409, detail=f"task is {row['state']}; no verified package published yet"
+                )
             raise HTTPException(409, detail="package file is gone; refresh the task")
+
+        def iterfile():
+            with handle:
+                while chunk := handle.read(1024 * 1024):
+                    yield chunk
+
         filename = f"{row['station']}-{row['date']}.tar.gz"
-        return FileResponse(
-            row["package_path"],
+        return StreamingResponse(
+            iterfile(),
             media_type="application/gzip",
-            filename=filename,
             headers={
+                "Content-Length": str(os.fstat(handle.fileno()).st_size),
+                "Content-Disposition": f'attachment; filename="{filename}"',
                 "Digest": f"sha-256={row['verified_sha256']}",
                 "ETag": f'"{row["verified_sha256"]}"',
             },
         )
+
+    @app.get(
+        "/tasks/{task_id}/revisions",
+        response_model=RevisionListView,
+        responses={404: {"model": ErrorResponse}},
+    )
+    async def list_revisions(task_id: str):
+        row = row_or_404(task_id)
+        return RevisionListView(
+            task_id=row["id"],
+            station=row["station"],
+            date=row["date"],
+            revisions=[_manifest_view(r) for r in collector.store.revisions(task_id)],
+        )
+
+    @app.get(
+        "/tasks/{task_id}/revisions/latest",
+        response_model=RevisionManifestView,
+        responses={404: {"model": ErrorResponse}},
+    )
+    async def latest_revision(task_id: str):
+        row_or_404(task_id)
+        manifest = collector.store.latest_revision(task_id)
+        if manifest is None:
+            raise HTTPException(404, detail="no revision manifests published yet")
+        return _manifest_view(manifest)
+
+    @app.get(
+        "/tasks/{task_id}/revisions/{seq}",
+        response_model=RevisionManifestView,
+        responses={404: {"model": ErrorResponse}},
+    )
+    async def get_revision(task_id: str, seq: int):
+        row_or_404(task_id)
+        manifest = collector.store.revision(task_id, seq)
+        if manifest is None:
+            raise HTTPException(404, detail="revision manifest not found")
+        return _manifest_view(manifest)
 
     @app.get("/")
     async def index(request: Request):
@@ -216,6 +310,9 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
                 "POST /tasks/{id}/refresh",
                 "GET /tasks/{id}/events",
                 "GET /tasks/{id}/package",
+                "GET /tasks/{id}/revisions",
+                "GET /tasks/{id}/revisions/latest",
+                "GET /tasks/{id}/revisions/{seq}",
             ],
         }
 

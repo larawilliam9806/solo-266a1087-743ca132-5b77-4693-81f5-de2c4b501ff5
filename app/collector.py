@@ -15,6 +15,15 @@ Invariants enforced here
 * A package becomes downloadable only after size and SHA-256 both match the
   directory entry *and* the file is atomically renamed into place; only then is
   the task marked completed.
+* The current publication (``package_path`` + ``verified_*``) is never cleared
+  by a refresh, a failure or an interruption: the previous validated package
+  stays downloadable until its replacement is fully verified and committed.
+* Revision impact: when a refresh replaces a published package, both versions'
+  ``observations.csv`` are parsed and validated (station/date/values) BEFORE
+  anything is published, and the diff manifest is committed in the SAME
+  transaction as the task's completion — a new package is never visible next
+  to a stale manifest, and a crash can never leave half a manifest behind.
+  An unchanged source package produces no new manifest.
 """
 
 from __future__ import annotations
@@ -32,7 +41,8 @@ import httpx
 
 from .config import Settings
 from .models import CatalogEntry
-from .store import Store, utcnow
+from .observations import PackageError, diff_observations, read_observations
+from .store import CasConflict, Store, utcnow
 
 log = logging.getLogger("collector.worker")
 
@@ -141,8 +151,6 @@ class Collector:
             "generation": generation,
             "error": None,
             "attempts": row["attempts"] + 1,
-            "verified_size": None,
-            "verified_sha256": None,
         }
         if state == "failed":
             # Resume only a failure that kept a valid partial prefix; terminal
@@ -168,7 +176,12 @@ class Collector:
         return {"state": "running", "detail": "started"}
 
     async def refresh(self, task_id: str) -> dict[str, str]:
-        """Re-read the directory for a completed task; collect again if it moved."""
+        """Re-read the directory for a completed task; collect again if it moved.
+
+        The current publication stays pinned: the previous validated package
+        keeps its ``verified_*`` fields and remains downloadable for the whole
+        refresh, and it is only replaced together with its revision manifest.
+        """
         row = self.get_row(task_id)
         if row["state"] != "completed":
             return {"state": row["state"], "detail": "refresh requires a completed task"}
@@ -180,8 +193,6 @@ class Collector:
             generation=generation,
             error=None,
             attempts=row["attempts"] + 1,
-            verified_size=None,
-            verified_sha256=None,
         ):
             return {"state": "unknown", "detail": "state changed concurrently"}
         self.store.event(task_id, "refresh", "re-reading source directory")
@@ -263,6 +274,11 @@ class Collector:
             log.info("task %s interrupted; progress kept", run.task_id)
         except FatalSourceError as exc:
             self._fail(run, str(exc), retryable=False)
+        except PackageError as exc:
+            # The fetched package fails validation (bad station/date/values,
+            # unreadable CSV, ...): fail the refresh.  The previous validated
+            # package and its manifest stay published.
+            self._fail(run, f"invalid package: {exc}", retryable=False)
         except asyncio.CancelledError:
             raise
         except TransferError as exc:
@@ -279,8 +295,11 @@ class Collector:
                 self._runs.pop(run.task_id, None)
 
     def _fail(self, run: RunningTask, message: str, retryable: bool) -> None:
+        # The current publication (package_path + verified_*) is deliberately
+        # never touched here: a failed refresh must keep the previous validated
+        # package downloadable together with its last manifest.  A first
+        # download that never published simply has nothing to keep.
         row = self.store.get(run.task_id)
-        stale_package = Path(row["package_path"]) if row and row["package_path"] else None
         if retryable:
             part = Path(row["part_path"]) if row and row["part_path"] else None
             keep = part.stat().st_size if part and part.exists() else 0
@@ -300,16 +319,13 @@ class Collector:
                 expected_generation=run.generation,
                 error=message,
                 part_path=None,
-                package_path=None,
                 downloaded_bytes=0,
             )
         if moved:
             if not retryable:
-                # Terminal failure: no half package and nothing that could be
-                # mistaken for resumable data.
+                # Terminal failure: no partial data that could be mistaken for
+                # resumable bytes.  The published package, if any, stays.
                 self._discard_parts(run.task_id)
-                if stale_package:
-                    stale_package.unlink(missing_ok=True)
             self.store.event(
                 run.task_id,
                 "failed",
@@ -428,6 +444,8 @@ class Collector:
         same_identity = self._identity_matches(row, entry)
         if not same_identity:
             # Never stitch two revisions: drop partial data and stale metadata.
+            # The previous publication (verified_* + package_path) is NOT
+            # cleared: it stays downloadable until the replacement commits.
             self._discard_parts(run.task_id)
             self._update(
                 run,
@@ -438,8 +456,6 @@ class Collector:
                 expected_sha256=entry.sha256,
                 downloaded_bytes=0,
                 part_path=str(part),
-                verified_size=None,
-                verified_sha256=None,
                 error=None,
             )
             log.info("dropped stale partial for %s (revision %s)", run.task_id, entry.revision)
@@ -586,6 +602,35 @@ class Collector:
         row = self.store.get(run.task_id)
         station, date = row["station"], row["date"]
         final = self.settings.packages_dir / f"{station}-{date}-{entry.sha256[:12]}.tar.gz"
+
+        # Revision impact, step 1: the new package's observations must parse
+        # and validate (station/date/values) BEFORE anything is published.
+        # A bad package fails the whole refresh and the old publication stays.
+        new_observations = read_observations(part, station, date)
+
+        # Step 2: when a previous validated package is being replaced, pin it
+        # and diff both versions aligned by time.  The manifest must be
+        # complete before the new package may be published at all.
+        manifest: dict[str, Any] | None = None
+        previous_sha = row["verified_sha256"]
+        if previous_sha and previous_sha != entry.sha256:
+            previous_path = row["package_path"]
+            if not previous_path or not Path(previous_path).is_file():
+                raise PackageError(
+                    "previous validated package is missing; "
+                    "cannot build a complete revision manifest"
+                )
+            previous_observations = read_observations(previous_path, station, date)
+            manifest = {
+                "station": station,
+                "date": date,
+                "previous_sha256": previous_sha,
+                "current_sha256": entry.sha256,
+                "previous_revision": row["published_revision"],
+                "current_revision": entry.revision,
+                "changes": diff_observations(previous_observations, new_observations),
+            }
+
         fd, tmp_name = tempfile.mkstemp(prefix=".publish-", dir=self.settings.packages_dir)
         tmp = Path(tmp_name)
         try:
@@ -599,31 +644,43 @@ class Collector:
             tmp.unlink(missing_ok=True)
             raise
 
-        moved = self.store.cas_state(
-            run.task_id,
-            "running",
-            "completed",
-            expected_generation=run.generation,
-            part_path=None,
-            package_path=str(final),
-            downloaded_bytes=entry.size,
-            verified_size=entry.size,
-            verified_sha256=entry.sha256,
-            error=None,
-            completed_at=utcnow(),
-        )
-        if not moved:
+        # Step 3: mark the task completed AND append the manifest in a single
+        # transaction, so the package and its revision list are always seen as
+        # one publication — before, during and after any restart.
+        try:
+            self.store.complete_publication(
+                run.task_id,
+                run.generation,
+                manifest=manifest,
+                part_path=None,
+                package_path=str(final),
+                downloaded_bytes=entry.size,
+                verified_size=entry.size,
+                verified_sha256=entry.sha256,
+                published_revision=entry.revision,
+                error=None,
+                completed_at=utcnow(),
+            )
+        except CasConflict:
             # A pause (or a newer generation) won the race: remove the artifact
             # and keep the part file so the task is never falsely completed and
-            # never exposes an unverified/half package.
-            final.unlink(missing_ok=True)
+            # never exposes an unverified/half package.  When the target path IS
+            # the currently published package (unchanged-source republish), the
+            # file must survive — the publication is still in force.
+            if str(final) != row["package_path"]:
+                final.unlink(missing_ok=True)
             raise Interrupted()
 
         if part != final:
             part.unlink(missing_ok=True)
         for old in self.settings.packages_dir.glob(f"{station}-{date}-*.tar.gz"):
             if old != final:
-                old.unlink(missing_ok=True)
+                try:
+                    old.unlink(missing_ok=True)
+                except OSError:
+                    # A reader may hold the file open; a leftover superseded
+                    # package is harmless and cleaned up by the next publish.
+                    log.warning("could not remove superseded package %s", old, exc_info=True)
         self.store.event(run.task_id, "verified", f"sha256={entry.sha256} size={entry.size}")
 
     def _discard_parts(self, task_id: str, keep: Path | None = None) -> None:

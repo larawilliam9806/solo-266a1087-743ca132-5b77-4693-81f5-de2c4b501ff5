@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -23,6 +24,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     package_path TEXT,
     verified_size INTEGER,
     verified_sha256 TEXT,
+    published_revision TEXT,
+    latest_revision_seq INTEGER,
     error TEXT,
     attempts INTEGER NOT NULL DEFAULT 0,
     resyncs INTEGER NOT NULL DEFAULT 0,
@@ -42,11 +45,44 @@ CREATE TABLE IF NOT EXISTS task_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, seq);
+
+-- Revision-impact manifests.  One row per publication that changed the
+-- package; inserted in the SAME transaction that marks the task completed, so
+-- the pair (published package, manifest) is atomic: after any crash the
+-- database shows either the whole previous publication or the whole new one,
+-- never a new package with a stale list nor half a list.
+CREATE TABLE IF NOT EXISTS revision_manifests (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    station TEXT NOT NULL,
+    date TEXT NOT NULL,
+    previous_sha256 TEXT NOT NULL,
+    current_sha256 TEXT NOT NULL,
+    previous_revision TEXT,
+    current_revision TEXT,
+    changes_json TEXT NOT NULL,
+    added_count INTEGER NOT NULL,
+    withdrawn_count INTEGER NOT NULL,
+    changed_count INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, seq)
+);
 """
+
+# Columns added after the initial release; CREATE TABLE IF NOT EXISTS does not
+# retrofit them onto existing databases, so they are migrated explicitly.
+TASK_COLUMN_MIGRATIONS = (
+    ("published_revision", "ALTER TABLE tasks ADD COLUMN published_revision TEXT"),
+    ("latest_revision_seq", "ALTER TABLE tasks ADD COLUMN latest_revision_seq INTEGER"),
+)
 
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+class CasConflict(Exception):
+    """A guarded write lost the race; its transaction was rolled back."""
 
 
 class Store:
@@ -64,6 +100,10 @@ class Store:
         with self.connection() as conn:
             conn.executescript(SCHEMA)
             conn.execute("PRAGMA journal_mode=WAL")
+            existing = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+            for column, ddl in TASK_COLUMN_MIGRATIONS:
+                if column not in existing:
+                    conn.execute(ddl)
 
     def connection(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -186,6 +226,112 @@ class Store:
     def event(self, task_id: str, event: str, detail: str | None = None) -> None:
         with self.transaction() as conn:
             self._event(conn, task_id, event, detail, utcnow())
+
+    def complete_publication(
+        self,
+        task_id: str,
+        generation: int,
+        manifest: dict[str, Any] | None = None,
+        **fields: Any,
+    ) -> int | None:
+        """Publish a package and its revision manifest in ONE transaction.
+
+        The task moves to ``completed`` only if it is still ``running`` at
+        ``generation``; when ``manifest`` is given it is appended with the next
+        per-task sequence number and ``latest_revision_seq`` is pointed at it
+        in the same commit.  Returns the manifest sequence number (``None``
+        when the publication needed no manifest).  Anything else visible —
+        the old package, the old manifest list — stays untouched until the
+        commit, so readers never see a new package beside a stale list.
+        Raises :class:`CasConflict` if the generation guard fails.
+        """
+        now = utcnow()
+        with self.transaction() as conn:
+            seq: int | None = None
+            if manifest is not None:
+                seq = conn.execute(
+                    "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq "
+                    "FROM revision_manifests WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()["next_seq"]
+                changes = manifest["changes"]
+                added = sum(1 for c in changes if c["kind"] == "added")
+                withdrawn = sum(1 for c in changes if c["kind"] == "withdrawn")
+                changed = sum(1 for c in changes if c["kind"] == "changed")
+                conn.execute(
+                    "INSERT INTO revision_manifests (task_id, seq, station, date, "
+                    "previous_sha256, current_sha256, previous_revision, "
+                    "current_revision, changes_json, added_count, withdrawn_count, "
+                    "changed_count, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        task_id,
+                        seq,
+                        manifest["station"],
+                        manifest["date"],
+                        manifest["previous_sha256"],
+                        manifest["current_sha256"],
+                        manifest["previous_revision"],
+                        manifest["current_revision"],
+                        json.dumps(changes),
+                        added,
+                        withdrawn,
+                        changed,
+                        now,
+                    ),
+                )
+                self._event(
+                    conn,
+                    task_id,
+                    "revision_manifest",
+                    f"seq={seq} added={added} withdrawn={withdrawn} changed={changed}",
+                    now,
+                )
+            all_fields = {**fields, "state": "completed", "updated_at": now}
+            if seq is not None:
+                all_fields["latest_revision_seq"] = seq
+            assignments = ", ".join(f"{name}=?" for name in all_fields)
+            cur = conn.execute(
+                f"UPDATE tasks SET {assignments} "
+                "WHERE id=? AND state='running' AND generation=?",
+                [*all_fields.values(), task_id, generation],
+            )
+            if cur.rowcount != 1:
+                raise CasConflict(task_id)
+            self._event(conn, task_id, "completed", None, now)
+            return seq
+
+    # -- revision manifests ------------------------------------------------
+    def revisions(self, task_id: str) -> list[sqlite3.Row]:
+        return (
+            self.connection()
+            .execute(
+                "SELECT * FROM revision_manifests WHERE task_id=? ORDER BY seq",
+                (task_id,),
+            )
+            .fetchall()
+        )
+
+    def revision(self, task_id: str, seq: int) -> sqlite3.Row | None:
+        return (
+            self.connection()
+            .execute(
+                "SELECT * FROM revision_manifests WHERE task_id=? AND seq=?",
+                (task_id, seq),
+            )
+            .fetchone()
+        )
+
+    def latest_revision(self, task_id: str) -> sqlite3.Row | None:
+        return (
+            self.connection()
+            .execute(
+                "SELECT * FROM revision_manifests WHERE task_id=? "
+                "ORDER BY seq DESC LIMIT 1",
+                (task_id,),
+            )
+            .fetchone()
+        )
 
     def events(self, task_id: str) -> list[sqlite3.Row]:
         return (

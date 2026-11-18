@@ -92,10 +92,58 @@ class TaskView(BaseModel):
     attempts: int = 0
     resyncs: int = 0
     generation: int = 0
+    latest_revision_seq: int | None = None
     created_at: str
     updated_at: str
     completed_at: str | None = None
     download_url: str | None = None
+    revisions_url: str | None = None
+
+
+class ChangeKind(StrEnum):
+    ADDED = "added"
+    WITHDRAWN = "withdrawn"
+    CHANGED = "changed"
+
+
+class ObservationValues(BaseModel):
+    temperature_c: float
+    pressure_hpa: float
+    wind_mps: float
+
+
+class RevisionChange(BaseModel):
+    """One affected moment: added, withdrawn, or value(s) changed."""
+
+    time: str
+    kind: ChangeKind
+    before: ObservationValues | None = None
+    after: ObservationValues | None = None
+    fields: list[str] = Field(default_factory=list)
+
+
+class RevisionManifestView(BaseModel):
+    """The revision-impact list published together with one package version."""
+
+    seq: int
+    station: str
+    date: str
+    previous_sha256: str
+    current_sha256: str
+    previous_revision: str | None = None
+    current_revision: str | None = None
+    created_at: str
+    added: int
+    withdrawn: int
+    changed: int
+    changes: list[RevisionChange]
+
+
+class RevisionListView(BaseModel):
+    task_id: str
+    station: str
+    date: str
+    revisions: list[RevisionManifestView]
 
 
 class ErrorResponse(BaseModel):

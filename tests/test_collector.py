@@ -33,6 +33,7 @@ async def _wait(client: httpx.AsyncClient, api: str, task_id: str, states: set[s
 @pytest.fixture
 async def stack(tmp_path):
     source_state.revisions.clear()
+    source_state.overrides.clear()
     source_state.delay_seconds = 0.0
     source_state.chunk_delay_seconds = 0.0
     source_state.failing.clear()
